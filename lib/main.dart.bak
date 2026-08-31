@@ -1,0 +1,2199 @@
+// =============================================================================
+// ZULU BUTTONS
+// Drone canister pump control panel
+// Targets: Windows / Linux (incl. Raspberry Pi OS) / Android
+// Talks to Pi at 192.168.8.2 (configurable)
+// =============================================================================
+
+import 'dart:convert';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'services/commands.dart';
+import 'services/udp_service.dart';
+import 'services/event_log.dart';
+import 'actuator_page.dart';
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const PuneApp());
+}
+
+// -----------------------------------------------------------------------------
+// THEME TOKENS
+// -----------------------------------------------------------------------------
+
+const Color kBg = Color(0xFF0A0A0A); // near-black background
+const Color kSurface = Color(0xFF161616); // card surface
+const Color kSurface2 = Color(0xFF222222); // raised / input surface
+const Color kBorder = Color(0xFF2A2A2A); // hairline border
+const Color kAccent = Color(0xFFFFC72C); // industrial caution yellow
+const Color kAccentDim = Color(0xFFB8901F); // dim accent
+const Color kDanger = Color(0xFFFF5252);
+const Color kSuccess = Color(0xFF4CAF50);
+const Color kTextPrimary = Color(0xFFFFFFFF);
+const Color kTextDim = Color(0xFF888888);
+
+const String kMono = 'monospace';
+
+// -----------------------------------------------------------------------------
+// APP ROOT
+// -----------------------------------------------------------------------------
+
+class PuneApp extends StatelessWidget {
+  const PuneApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Zulu Buttons',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: kBg,
+        canvasColor: kSurface,
+        colorScheme: const ColorScheme.dark(
+          primary: kAccent,
+          secondary: kAccent,
+          surface: kSurface,
+          onPrimary: Colors.black,
+          onSurface: kTextPrimary,
+        ),
+        appBarTheme: const AppBarTheme(
+          backgroundColor: kBg,
+          foregroundColor: kAccent,
+          elevation: 0,
+          centerTitle: false,
+        ),
+        sliderTheme: const SliderThemeData(
+          activeTrackColor: kAccent,
+          inactiveTrackColor: kSurface2,
+          thumbColor: kAccent,
+          trackHeight: 6,
+        ),
+      ),
+      home: const HomePage(),
+    );
+  }
+}
+
+// =============================================================================
+// MODELS
+// =============================================================================
+
+class PumpButton {
+  String id;
+  String label;
+  String endpoint; // UDP command string (e.g. "2")
+  int port; // UDP destination port (3000 or 9000)
+  bool isToggle;
+  String toggleOffEndpoint;
+  bool locked;
+
+  PumpButton({
+    required this.id,
+    required this.label,
+    this.endpoint = '',
+    this.port = 3000,
+    this.isToggle = false,
+    this.toggleOffEndpoint = '',
+    this.locked = false,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'label': label,
+    'endpoint': endpoint,
+    'port': port,
+    'isToggle': isToggle,
+    'toggleOffEndpoint': toggleOffEndpoint,
+    'locked': locked,
+  };
+
+  factory PumpButton.fromJson(Map<String, dynamic> j) => PumpButton(
+    id: j['id'] ?? DateTime.now().millisecondsSinceEpoch.toString(),
+    label: j['label'] ?? 'Button',
+    endpoint: j['endpoint'] ?? '',
+    port: j['port'] ?? 3000,
+    isToggle: j['isToggle'] ?? false,
+    toggleOffEndpoint: j['toggleOffEndpoint'] ?? '',
+    locked: j['locked'] ?? false,
+  );
+}
+
+class AppConfig {
+  String piHost;
+  int piPort;
+  String pressureEndpoint;
+  double pressureMin;
+  double pressureMax;
+
+  AppConfig({
+    this.piHost = '192.168.8.2',
+    this.piPort = 80,
+    this.pressureEndpoint = '/pressure',
+    this.pressureMin = 0,
+    this.pressureMax = 150,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'piHost': piHost,
+    'piPort': piPort,
+    'pressureEndpoint': pressureEndpoint,
+    'pressureMin': pressureMin,
+    'pressureMax': pressureMax,
+  };
+
+  factory AppConfig.fromJson(Map<String, dynamic> j) => AppConfig(
+    piHost: j['piHost'] ?? '192.168.8.2',
+    piPort: j['piPort'] ?? 80,
+    pressureEndpoint: j['pressureEndpoint'] ?? '/pressure',
+    pressureMin: (j['pressureMin'] ?? 0).toDouble(),
+    pressureMax: (j['pressureMax'] ?? 150).toDouble(),
+  );
+}
+
+// =============================================================================
+// STORAGE
+// =============================================================================
+
+class Storage {
+  static const _kButtons = 'pump_buttons_v11';
+  static const _kConfig = 'app_config_v1';
+
+  static Future<List<PumpButton>> loadButtons() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_kButtons);
+    if (raw == null) return _defaultButtons();
+    try {
+      final List list = jsonDecode(raw);
+      return list.map((e) => PumpButton.fromJson(e)).toList();
+    } catch (_) {
+      return _defaultButtons();
+    }
+  }
+
+  static Future<void> saveButtons(List<PumpButton> btns) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _kButtons,
+      jsonEncode(btns.map((b) => b.toJson()).toList()),
+    );
+  }
+
+  static Future<AppConfig> loadConfig() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_kConfig);
+    if (raw == null) return AppConfig();
+    try {
+      return AppConfig.fromJson(jsonDecode(raw));
+    } catch (_) {
+      return AppConfig();
+    }
+  }
+
+  static Future<void> saveConfig(AppConfig c) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kConfig, jsonEncode(c.toJson()));
+  }
+
+  static List<PumpButton> _defaultButtons() => [
+    PumpButton(
+      id: 'pump_start',
+      label: 'PUMP START',
+      endpoint: '0x05',
+      port: 9000,
+      isToggle: true,
+      locked: true,
+    ),
+    PumpButton(
+      id: 'pump_toggle',
+      label: 'PUMP POWER',
+      endpoint: '0x06',
+      port: 9000,
+      isToggle: true,
+      locked: true,
+    ),
+    PumpButton(
+      id: 'canister_1',
+      label: 'CANISTER 1',
+      endpoint: Cmd.canister1,
+      port: Cmd.port,
+      locked: true,
+    ),
+    PumpButton(
+      id: 'canister_2',
+      label: 'CANISTER 2',
+      endpoint: Cmd.canister2,
+      port: Cmd.port,
+      locked: true,
+    ),
+  ];
+}
+
+// =============================================================================
+// HOME PAGE
+// =============================================================================
+
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  List<PumpButton> _buttons = [];
+  AppConfig _config = AppConfig();
+  bool _loading = true;
+  double _pressure = 80.0;
+  final Set<String> _activeToggles = {};
+
+  // 0 = "2 CANISTER" (this screen's own pump/canister controls)
+  // 1 = "9 CANISTER" (the Linear Actuator Control screen)
+  int _selectedProject = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _bootstrap();
+  }
+
+  Future<void> _bootstrap() async {
+    final buttons = await Storage.loadButtons();
+    final config = await Storage.loadConfig();
+    if (!mounted) return;
+    setState(() {
+      _buttons = buttons;
+      _config = config;
+      _pressure = 80.0;
+      _loading = false;
+    });
+  }
+
+  @override
+  void dispose() {
+    super.dispose();
+  }
+
+  // ---------------- actions ----------------
+
+  void _onButtonTap(PumpButton btn) {
+    HapticFeedback.lightImpact();
+
+    // raw-byte path (pump → port 9000, matches joystick_sender.cpp)
+    if (btn.endpoint.startsWith('0x')) {
+      final byte = int.tryParse(btn.endpoint.substring(2), radix: 16);
+      if (byte == null) return;
+      if (btn.isToggle) {
+        final turningOn = !_activeToggles.contains(btn.id);
+        UdpService.sendByte(byte, port: btn.port);
+        setState(() {
+          if (turningOn) {
+            _activeToggles.add(btn.id);
+          } else {
+            _activeToggles.remove(btn.id);
+          }
+        });
+        _showSnack(
+          '${btn.label} → ${turningOn ? 'ON' : 'OFF'}',
+          turningOn ? kSuccess : kAccentDim,
+        );
+       EventLog.log(
+          '${btn.label} turned ${turningOn ? 'ON' : 'OFF'}',
+          channel: EventLog.channelTwoCanister,
+          binary: 'byte 0x${byte.toRadixString(16).padLeft(2, '0')} → ${_config.piHost}:${btn.port}',
+        );
+      } else {
+        UdpService.sendByte(byte, port: btn.port);
+        _showSnack('${btn.label} → ${btn.endpoint}', kSuccess);
+        EventLog.log(
+          '${btn.label} triggered',
+          channel: EventLog.channelTwoCanister,
+          binary: 'byte 0x${byte.toRadixString(16).padLeft(2, '0')} → ${_config.piHost}:${btn.port}',
+        );
+      }
+      return;
+    }
+
+    // ASCII path (canisters → port 3000) — unchanged
+    if (btn.isToggle) {
+      final turningOn = !_activeToggles.contains(btn.id);
+      final cmd = (!turningOn && btn.toggleOffEndpoint.isNotEmpty)
+          ? btn.toggleOffEndpoint
+          : btn.endpoint;
+      if (cmd.isNotEmpty) UdpService.send(cmd, port: btn.port);
+      setState(() {
+        if (turningOn) {
+          _activeToggles.add(btn.id);
+        } else {
+          _activeToggles.remove(btn.id);
+        }
+      });
+      _showSnack(
+        '${btn.label} → ${turningOn ? 'ON' : 'OFF'}',
+        turningOn ? kSuccess : kAccentDim,
+      );
+    EventLog.log(
+        '${btn.label} turned ${turningOn ? 'ON' : 'OFF'}',
+        channel: EventLog.channelTwoCanister,
+        binary: "cmd '$cmd' → ${_config.piHost}:${btn.port}",
+      );
+      return;
+    }
+    if (btn.endpoint.isEmpty) return;
+   UdpService.send(btn.endpoint, port: btn.port);
+    _showSnack('${btn.label} → ${btn.endpoint}', kSuccess);
+    EventLog.log(
+      '${btn.label} triggered',
+      channel: EventLog.channelTwoCanister,
+      binary: "cmd '${btn.endpoint}' → ${_config.piHost}:${btn.port}",
+    );
+  }
+
+  Future<void> _editButton(PumpButton? btn) async {
+    if (btn != null && btn.locked) return;
+    final result = await showDialog<PumpButton>(
+      context: context,
+      builder: (_) => EditButtonDialog(button: btn),
+    );
+    if (result == null) return;
+    setState(() {
+      if (btn == null) {
+        _buttons.add(result);
+      } else {
+        final idx = _buttons.indexWhere((b) => b.id == btn.id);
+        if (idx >= 0) _buttons[idx] = result;
+      }
+    });
+    await Storage.saveButtons(_buttons);
+  }
+
+  Future<void> _deleteButton(PumpButton btn) async {
+    if (btn.locked) return;
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: kSurface,
+        title: const Text(
+          'DELETE BUTTON',
+          style: TextStyle(color: kAccent, letterSpacing: 2, fontSize: 16),
+        ),
+        content: Text(
+          'Remove "${btn.label}" ?',
+          style: const TextStyle(color: kTextDim),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text(
+              'CANCEL',
+              style: TextStyle(color: kTextDim, letterSpacing: 1),
+            ),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text(
+              'DELETE',
+              style: TextStyle(
+                color: kDanger,
+                letterSpacing: 1,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (confirm == true) {
+      setState(() {
+        _buttons.removeWhere((b) => b.id == btn.id);
+        _activeToggles.remove(btn.id);
+      });
+      await Storage.saveButtons(_buttons);
+    }
+  }
+
+  Future<void> _openSettings() async {
+    final result = await showDialog<AppConfig>(
+      context: context,
+      builder: (_) => SettingsDialog(config: _config),
+    );
+    if (result != null) {
+      setState(() => _config = result);
+      await Storage.saveConfig(result);
+    }
+  }
+
+  Future<void> _openButtonManager() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: kSurface,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(12)),
+      ),
+      builder: (ctx) => DraggableScrollableSheet(
+        initialChildSize: 0.6,
+        minChildSize: 0.3,
+        maxChildSize: 0.9,
+        expand: false,
+        builder: (_, scrollCtrl) => Column(
+          children: [
+            Container(
+              margin: const EdgeInsets.symmetric(vertical: 10),
+              width: 40,
+              height: 4,
+              decoration: BoxDecoration(
+                color: kBorder,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+              child: Row(
+                children: [
+                  const Text(
+                    'EDIT BUTTONS',
+                    style: TextStyle(
+                      color: kAccent,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 3,
+                      fontSize: 13,
+                    ),
+                  ),
+                  const Spacer(),
+                  TextButton.icon(
+                    onPressed: () async {
+                      Navigator.pop(ctx);
+                      await _editButton(null);
+                    },
+                    icon: const Icon(Icons.add, color: kAccent, size: 16),
+                    label: const Text(
+                      'NEW',
+                      style: TextStyle(
+                        color: kAccent,
+                        letterSpacing: 2,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(color: kBorder, height: 1),
+            Expanded(
+              child: _buttons.isEmpty
+                  ? const Center(
+                      child: Text(
+                        'NO BUTTONS YET',
+                        style: TextStyle(color: kTextDim, letterSpacing: 2),
+                      ),
+                    )
+                  : ListView.separated(
+                      controller: scrollCtrl,
+                      itemCount: _buttons.length,
+                      separatorBuilder: (_, __) =>
+                          const Divider(color: kBorder, height: 1),
+                      itemBuilder: (_, i) {
+                        final btn = _buttons[i];
+                        return ListTile(
+                          title: Text(
+                            btn.label,
+                            style: const TextStyle(
+                              color: kTextPrimary,
+                              fontWeight: FontWeight.w700,
+                              letterSpacing: 1,
+                            ),
+                          ),
+                          subtitle: Text(
+                            'CMD: ${btn.endpoint}',
+                            style: const TextStyle(
+                              color: kTextDim,
+                              fontFamily: kMono,
+                              fontSize: 11,
+                            ),
+                          ),
+                          trailing: btn.locked
+                              ? const Icon(
+                                  Icons.lock_outline,
+                                  color: kTextDim,
+                                  size: 18,
+                                )
+                              : Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    IconButton(
+                                      icon: const Icon(
+                                        Icons.edit,
+                                        color: kAccent,
+                                        size: 18,
+                                      ),
+                                      onPressed: () async {
+                                        Navigator.pop(ctx);
+                                        await _editButton(btn);
+                                      },
+                                    ),
+                                    IconButton(
+                                      icon: const Icon(
+                                        Icons.delete_outline,
+                                        color: kDanger,
+                                        size: 18,
+                                      ),
+                                      onPressed: () async {
+                                        Navigator.pop(ctx);
+                                        await _deleteButton(btn);
+                                      },
+                                    ),
+                                  ],
+                                ),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _setPressure() async {
+    // Intentionally NOT firing the HTTP request — pressure control is
+    // not wired up yet. UI lives, transport is parked.
+    HapticFeedback.mediumImpact();
+    if (!mounted) return;
+    _showSnack(
+      'PRESSURE  ${_pressure.toStringAsFixed(0)} PSI  ·  NOT WIRED UP',
+      kAccentDim,
+    );
+    EventLog.log('Pressure reading updated: ${_pressure.toStringAsFixed(0)} PSI → :${_config.piPort}', channel: EventLog.channelTwoCanister);
+  }
+
+  Future<void> _openPressureDialog() async {
+    final pressureController = TextEditingController(
+      text: _pressure.toStringAsFixed(0),
+    );
+
+    await showDialog<void>(
+      context: context,
+      builder: (_) => StatefulBuilder(
+        builder: (ctx, setLocal) => Dialog(
+          backgroundColor: kSurface,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 460),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(20, 18, 20, 16),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Row(
+                    children: [
+                      const Icon(
+                        Icons.speed_outlined,
+                        color: kAccent,
+                        size: 18,
+                      ),
+                      const SizedBox(width: 8),
+                      const Text(
+                        'PRESSURE',
+                        style: TextStyle(
+                          color: kAccent,
+                          fontWeight: FontWeight.w900,
+                          letterSpacing: 3,
+                          fontSize: 13,
+                        ),
+                      ),
+                      const Spacer(),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 6,
+                          vertical: 2,
+                        ),
+                        decoration: BoxDecoration(
+                          color: kAccentDim.withOpacity(0.15),
+                          borderRadius: BorderRadius.circular(3),
+                          border: Border.all(color: kAccentDim, width: 1),
+                        ),
+                        child: const Text(
+                          'PARKED',
+                          style: TextStyle(
+                            color: kAccentDim,
+                            fontSize: 9,
+                            fontWeight: FontWeight.w900,
+                            letterSpacing: 2,
+                          ),
+                        ),
+                      ),
+                      IconButton(
+                        icon: const Icon(
+                          Icons.close,
+                          color: kTextDim,
+                          size: 18,
+                        ),
+                        onPressed: () => Navigator.pop(ctx),
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 18),
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      Text(
+                        _pressure.toStringAsFixed(0),
+                        style: const TextStyle(
+                          color: kTextPrimary,
+                          fontSize: 48,
+                          fontFamily: kMono,
+                          fontWeight: FontWeight.w900,
+                          height: 1,
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      const Padding(
+                        padding: EdgeInsets.only(bottom: 6),
+                        child: Text(
+                          'PSI',
+                          style: TextStyle(
+                            color: kTextDim,
+                            fontSize: 13,
+                            letterSpacing: 2,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: pressureController,
+                    textAlign: TextAlign.center,
+                    keyboardType: TextInputType.number,
+                    maxLength: 3,
+                    inputFormatters: [
+                      FilteringTextInputFormatter.digitsOnly,
+                      LengthLimitingTextInputFormatter(3),
+                    ],
+                    style: const TextStyle(
+                      color: kTextPrimary,
+                      fontFamily: kMono,
+                      fontSize: 16,
+                    ),
+                    decoration: InputDecoration(
+                      counterText: '', // hide the built-in "x/3" counter
+                      hintText: 'Enter pressure (max 999)',
+                      hintStyle: const TextStyle(color: kTextDim, fontSize: 12),
+                      filled: true,
+                      fillColor: kSurface2,
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 10,
+                      ),
+                      enabledBorder: OutlineInputBorder(
+                        borderSide: const BorderSide(color: kBorder),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      focusedBorder: OutlineInputBorder(
+                        borderSide: const BorderSide(color: kAccent, width: 1.5),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                    ),
+                    onChanged: (text) {
+                      final parsed = int.tryParse(text);
+                      if (parsed == null) return;
+                      // Clamp to the configured min/max AND hard-cap at 999
+                      // (3 digits) regardless of what pressureMax is set to.
+                      final capped = parsed.clamp(
+                        _config.pressureMin.toInt(),
+                        _config.pressureMax.toInt().clamp(0, 999),
+                      );
+                      setLocal(() {});
+                      setState(() => _pressure = capped.toDouble());
+                    },
+                  ),
+                  const SizedBox(height: 8),
+                  Slider(
+                    value: _pressure.clamp(
+                      _config.pressureMin,
+                      _config.pressureMax,
+                    ),
+                    min: _config.pressureMin,
+                    max: _config.pressureMax,
+                    divisions: (_config.pressureMax - _config.pressureMin)
+                        .toInt(),
+                    onChanged: (v) {
+                      setLocal(() {
+                        pressureController.text = v.toStringAsFixed(0);
+                      });
+                      setState(() => _pressure = v);
+                    },
+                  ),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(
+                        _config.pressureMin.toStringAsFixed(0),
+                        style: const TextStyle(
+                          color: kTextDim,
+                          fontFamily: kMono,
+                          fontSize: 11,
+                        ),
+                      ),
+                      Text(
+                        _config.pressureMax.toStringAsFixed(0),
+                        style: const TextStyle(
+                          color: kTextDim,
+                          fontFamily: kMono,
+                          fontSize: 11,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton(
+                      onPressed: () {
+                        _setPressure();
+                        Navigator.pop(ctx);
+                      },
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: kAccent,
+                        foregroundColor: Colors.black,
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                      ),
+                      child: const Text(
+                        'SET PRESSURE',
+                        style: TextStyle(
+                          fontWeight: FontWeight.w900,
+                          letterSpacing: 3,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  const Text(
+                    'Pressure transport is parked — UI only.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: kTextDim,
+                      fontSize: 10,
+                      letterSpacing: 1,
+                      fontFamily: kMono,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showSnack(String msg, Color color) {
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.clearSnackBars();
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(
+          msg,
+          style: const TextStyle(
+            color: kTextPrimary,
+            fontFamily: kMono,
+            fontSize: 13,
+          ),
+        ),
+        backgroundColor: color.withOpacity(0.92),
+        duration: const Duration(seconds: 2),
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
+      ),
+    );
+  }
+
+  // ---------------- build ----------------
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator(color: kAccent)),
+      );
+    }
+    return Scaffold(
+      // No Scaffold-level AppBar — using a custom top bar instead (see
+      // _buildTopBar) so it only sits above the content column, not above
+      // the sidebar. This lets the sidebar reach all the way to the top
+      // of the window with no empty strip above it.
+      body: Stack(
+        children: [
+          Row(
+            children: [
+              _buildSidebar(),
+              Expanded(
+                child: Column(
+                  children: [
+                    _buildTopBar(),
+                    Expanded(
+                      child: _selectedProject == 0
+                          ? _buildTwoCanisterBody()
+                          : const ActuatorControlPage(embedded: true),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          Positioned(
+            right: 16,
+            bottom: 16,
+            child: _EventLogPanel(
+              key: ValueKey(_selectedProject), // fresh state per project
+              channel: _selectedProject == 0
+                  ? EventLog.channelTwoCanister
+                  : EventLog.channelNineCanister,
+              piHost: _config.piHost,
+              // 2 CANISTER uses both :9000 (pump, raw byte) and :3000
+              // (canisters, ASCII). 9 CANISTER uses :3000 for everything
+              // (see Cmd.port in services/commands.dart).
+              portsLabel: _selectedProject == 0
+                  ? ':9000 · :3000'
+                  : ':${Cmd.port}',
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTopBar() {
+    return Container(
+      height: 56,
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      decoration: const BoxDecoration(
+        color: kBg,
+        border: Border(bottom: BorderSide(color: kBorder)),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.end,
+        children: _selectedProject == 0
+            ? [
+                _UdpBadge(onTap: _openSettings),
+                IconButton(
+                  icon: const Icon(Icons.edit_outlined),
+                  tooltip: 'Edit buttons',
+                  onPressed: _openButtonManager,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.speed_outlined),
+                  tooltip: 'Pressure',
+                  onPressed: _openPressureDialog,
+                ),
+                const SizedBox(width: 4),
+              ]
+            : [_UdpBadge(onTap: _openSettings), const SizedBox(width: 4)],
+      ),
+    );
+  }
+
+  Widget _buildSidebar() {
+    return Container(
+      width: 220,
+      decoration: const BoxDecoration(
+        color: kSurface,
+        border: Border(right: BorderSide(color: kBorder)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 6, 16, 8),
+            child: Row(
+              children: [
+                Image.asset(
+                  'assets/zulu_button.png',
+                  width: 24,
+                  height: 24,
+                  filterQuality: FilterQuality.medium,
+                  errorBuilder: (_, _, _) => const _HazardChip(),
+                ),
+                const SizedBox(width: 8),
+                const Expanded(
+                  child: Text(
+                    'ZULU BUTTONS',
+                    style: TextStyle(
+                      color: kAccent,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 2,
+                      fontSize: 13,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const Divider(color: kBorder, height: 1),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 10, 16, 8),
+            child: Text(
+              'PROJECTS',
+              style: TextStyle(
+                color: kTextDim,
+                fontWeight: FontWeight.w900,
+                letterSpacing: 2,
+                fontSize: 11,
+              ),
+            ),
+          ),
+          _buildSidebarItem(
+            index: 0,
+            icon: Icons.grid_view_rounded,
+            label: '2 CANISTER',
+          ),
+          const SizedBox(height: 6),
+          _buildSidebarItem(
+            index: 1,
+            icon: Icons.tune,
+            label: '9 CANISTER',
+          ),
+          const Spacer(),
+          const Divider(color: kBorder, height: 1),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: InkWell(
+              onTap: _openSettings,
+              borderRadius: BorderRadius.circular(8),
+              child: Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 12,
+                ),
+                child: const Row(
+                  children: [
+                    Icon(Icons.settings_outlined, size: 18, color: kTextDim),
+                    SizedBox(width: 10),
+                    Text(
+                      'SETTINGS',
+                      style: TextStyle(
+                        color: kTextPrimary,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 1,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          const Padding(
+            padding: EdgeInsets.fromLTRB(12, 0, 12, 12),
+            child: Text(
+              'v0.2',
+              style: TextStyle(
+                color: kTextDim,
+                fontSize: 10,
+                fontFamily: kMono,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSidebarItem({
+    required int index,
+    required IconData icon,
+    required String label,
+  }) {
+    final selected = _selectedProject == index;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      child: InkWell(
+        onTap: () => setState(() => _selectedProject = index),
+        borderRadius: BorderRadius.circular(8),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+          decoration: BoxDecoration(
+            color: selected ? kAccent.withOpacity(0.14) : Colors.transparent,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: selected ? kAccent : Colors.transparent,
+              width: 1.2,
+            ),
+          ),
+          child: Row(
+            children: [
+              Icon(
+                icon,
+                size: 18,
+                color: selected ? kAccent : kTextDim,
+              ),
+              const SizedBox(width: 10),
+              Text(
+                label,
+                style: TextStyle(
+                  color: selected ? kAccent : kTextPrimary,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 1,
+                  fontSize: 12,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTwoCanisterBody() {
+    return SafeArea(
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          return SingleChildScrollView(
+            padding: const EdgeInsets.all(16),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 980),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  _SectionHeader(label: 'CONTROLS', count: _buttons.length),
+                  const SizedBox(height: 12),
+                  _buildButtonGrid(constraints.maxWidth),
+                  const SizedBox(height: 12),
+                  _buildAddButton(),
+                  const SizedBox(height: 24),
+                  _buildFooter(),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildButtonGrid(double maxWidth) {
+    if (_buttons.isEmpty) {
+      return _Panel(
+        child: const Padding(
+          padding: EdgeInsets.symmetric(vertical: 24),
+          child: Center(
+            child: Text(
+              'NO BUTTONS YET — TAP "+ ADD BUTTON" TO CREATE ONE',
+              style: TextStyle(color: kTextDim, letterSpacing: 1, fontSize: 12),
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ),
+      );
+    }
+    final cols = maxWidth > 880
+        ? 4
+        : maxWidth > 600
+        ? 3
+        : 2;
+    return GridView.builder(
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: cols,
+        childAspectRatio: 1.25,
+        mainAxisSpacing: 10,
+        crossAxisSpacing: 10,
+      ),
+      itemCount: _buttons.length,
+      itemBuilder: (_, i) {
+        final btn = _buttons[i];
+        return _PumpButtonTile(
+          button: btn,
+          isActive: _activeToggles.contains(btn.id),
+          onTap: () => _onButtonTap(btn),
+          onEdit: () => _editButton(btn),
+          onDelete: () => _deleteButton(btn),
+        );
+      },
+    );
+  }
+
+  Widget _buildAddButton() {
+    return InkWell(
+      onTap: () => _editButton(null),
+      borderRadius: BorderRadius.circular(8),
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 14),
+        decoration: BoxDecoration(
+          color: Colors.transparent,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: kAccent, width: 1.5),
+        ),
+        child: const Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.add, color: kAccent, size: 20),
+            SizedBox(width: 8),
+            Text(
+              'ADD BUTTON',
+              style: TextStyle(
+                color: kAccent,
+                fontWeight: FontWeight.w900,
+                letterSpacing: 3,
+                fontSize: 13,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildFooter() {
+    return Center(
+      child: Text(
+        'ZULU BUTTONS  ·  v0.2  ·  UDP :3000',
+        style: const TextStyle(
+          color: kTextDim,
+          fontSize: 10,
+          letterSpacing: 2,
+          fontFamily: kMono,
+        ),
+      ),
+    );
+  }
+}
+
+// =============================================================================
+// REUSABLE WIDGETS
+// =============================================================================
+
+/// Diagonal yellow/black hazard-stripe chip used as a brand mark next to title.
+class _HazardChip extends StatelessWidget {
+  const _HazardChip();
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 22,
+      height: 22,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: kAccent, width: 1.5),
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(3),
+        child: CustomPaint(painter: _HazardPainter()),
+      ),
+    );
+  }
+}
+
+class _HazardPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paintYellow = Paint()..color = kAccent;
+    final paintBlack = Paint()..color = Colors.black;
+    canvas.drawRect(Offset.zero & size, paintBlack);
+    final w = size.width, h = size.height;
+    final stride = 6.0;
+    for (double x = -h; x < w + h; x += stride * 2) {
+      final p = Path()
+        ..moveTo(x, 0)
+        ..lineTo(x + stride, 0)
+        ..lineTo(x + stride + h, h)
+        ..lineTo(x + h, h)
+        ..close();
+      canvas.drawPath(p, paintYellow);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+/// Small floating "LIVE EVENT LOG" panel, anchored to the bottom-right
+/// corner. Listens to EventLog.entries and updates automatically —
+/// works no matter which screen (2 CANISTER or 9 CANISTER) logged
+/// the event.
+class _EventLogPanel extends StatefulWidget {
+  final String channel;
+  final String piHost;
+  final String portsLabel; // e.g. ":9000 · :3000"
+  const _EventLogPanel({
+    super.key,
+    required this.channel,
+    required this.piHost,
+    required this.portsLabel,
+  });
+
+  @override
+  State<_EventLogPanel> createState() => _EventLogPanelState();
+}
+
+class _EventLogPanelState extends State<_EventLogPanel> {
+  bool _expanded = false;
+  bool _live = true;
+  int _logTab = 0; // 0 = LIVE LOG (plain English), 1 = BINARY LOG (technical)
+  List<LogEntry>? _frozenSnapshot; // captured when paused
+
+  void _toggleLive(List<LogEntry> currentEntries) {
+    setState(() {
+      if (_live) {
+        _frozenSnapshot = List<LogEntry>.from(currentEntries);
+      } else {
+        // Resuming — drop the snapshot, go back to live data.
+        _frozenSnapshot = null;
+      }
+      _live = !_live;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<List<LogEntry>>(
+      valueListenable: EventLog.entriesFor(widget.channel),
+      builder: (context, liveEntries, _) {
+        final entries = _live ? liveEntries : (_frozenSnapshot ?? liveEntries);
+
+        // Collapsed: last 8, newest at the bottom (original behavior).
+        // Expanded: everything, newest at the bottom, panel just grows
+        // upward into the empty space above it instead of opening a
+        // separate popup.
+        final visible = _expanded
+            ? entries
+            : (entries.length > 8
+                  ? entries.sublist(entries.length - 8)
+                  : entries);
+        return AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          width: 340,
+          constraints: BoxConstraints(
+            maxHeight: _expanded ? 560 : 280,
+          ),
+          decoration: BoxDecoration(
+            color: kSurface.withOpacity(0.96),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: kBorder),
+            boxShadow: const [
+              BoxShadow(
+                color: Colors.black45,
+                blurRadius: 12,
+                offset: Offset(0, 4),
+              ),
+            ],
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 10, 8, 8),
+                child: Row(
+                  children: [
+                    _LogTabButton(
+                      label: 'LIVE LOG',
+                      selected: _logTab == 0,
+                      onTap: () => setState(() => _logTab = 0),
+                    ),
+                    const SizedBox(width: 6),
+                    _LogTabButton(
+                      label: 'BINARY LOG',
+                      selected: _logTab == 1,
+                      onTap: () => setState(() => _logTab = 1),
+                    ),
+                    if (_expanded) ...[
+                      const SizedBox(width: 6),
+                      Text(
+                        '[${entries.length}]',
+                        style: const TextStyle(
+                          color: kTextDim,
+                          fontSize: 10,
+                          fontFamily: kMono,
+                        ),
+                      ),
+                    ],
+                    const Spacer(),
+                    // LIVE / PAUSED pill toggle
+                    InkWell(
+                      onTap: () => _toggleLive(liveEntries),
+                      borderRadius: BorderRadius.circular(20),
+                      child: Container(
+                        margin: const EdgeInsets.only(right: 4),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 3,
+                        ),
+                        decoration: BoxDecoration(
+                          color: (_live ? kSuccess : kTextDim).withOpacity(
+                            0.15,
+                          ),
+                          borderRadius: BorderRadius.circular(20),
+                          border: Border.all(
+                            color: _live ? kSuccess : kTextDim,
+                            width: 1,
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Container(
+                              width: 6,
+                              height: 6,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: _live ? kSuccess : kTextDim,
+                              ),
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              _live ? 'LIVE' : 'PAUSED',
+                              style: TextStyle(
+                                color: _live ? kSuccess : kTextDim,
+                                fontSize: 9,
+                                fontWeight: FontWeight.w900,
+                                letterSpacing: 1,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    InkWell(
+                      onTap: () => setState(() => _expanded = !_expanded),
+                      borderRadius: BorderRadius.circular(4),
+                      child: Padding(
+                        padding: const EdgeInsets.all(4),
+                        child: Icon(
+                          _expanded
+                              ? Icons.close_fullscreen
+                              : Icons.open_in_full,
+                          color: kTextDim,
+                          size: 14,
+                        ),
+                      ),
+                    ),
+                    InkWell(
+                      onTap: entries.isEmpty
+                          ? null
+                          : () => EventLog.clear(widget.channel),
+                      borderRadius: BorderRadius.circular(4),
+                      child: Padding(
+                        padding: const EdgeInsets.all(4),
+                        child: Icon(
+                          Icons.delete_outline,
+                          color: entries.isEmpty ? kBorder : kDanger,
+                          size: 14,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              // Connection info line — host + ports in use for this project.
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                child: Row(
+                  children: [
+                    const Icon(Icons.dns_outlined, color: kTextDim, size: 11),
+                    const SizedBox(width: 4),
+                    Expanded(
+                      child: Text(
+                        '${widget.piHost}  ·  ${widget.portsLabel}',
+                        style: const TextStyle(
+                          color: kTextDim,
+                          fontSize: 10,
+                          fontFamily: kMono,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const Divider(color: kBorder, height: 1),
+              Flexible(
+                child: visible.isEmpty
+                    ? const Padding(
+                        padding: EdgeInsets.all(12),
+                        child: Text(
+                          'No events yet',
+                          style: TextStyle(color: kTextDim, fontSize: 11),
+                        ),
+                      )
+                    : ListView.builder(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 8,
+                        ),
+                        shrinkWrap: true,
+                        itemCount: visible.length,
+                        itemBuilder: (_, i) => Padding(
+                          padding: const EdgeInsets.only(bottom: 4),
+                          child: Text(
+                            _logTab == 0 ? visible[i].human : visible[i].binary,
+                            style: const TextStyle(
+                              color: kTextDim,
+                              fontSize: 11,
+                              fontFamily: kMono,
+                            ),
+                          ),
+                        ),
+                      ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+class _LogTabButton extends StatelessWidget {
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+  const _LogTabButton({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(4),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+        decoration: BoxDecoration(
+          color: selected ? kAccent.withOpacity(0.14) : Colors.transparent,
+          borderRadius: BorderRadius.circular(4),
+          border: Border.all(
+            color: selected ? kAccent : kBorder,
+            width: 1,
+          ),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: selected ? kAccent : kTextDim,
+            fontWeight: FontWeight.w900,
+            letterSpacing: 1,
+            fontSize: 10,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+
+class _UdpBadge extends StatelessWidget {
+  final VoidCallback? onTap;
+  const _UdpBadge({this.onTap});
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      child: Center(
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(20),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+            decoration: BoxDecoration(
+              color: kAccent.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: kAccent, width: 1),
+            ),
+            child: const Text(
+              'UDP',
+              style: TextStyle(
+                color: kAccent,
+                fontSize: 10,
+                fontWeight: FontWeight.w900,
+                letterSpacing: 2,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _Panel extends StatelessWidget {
+  final Widget child;
+  final EdgeInsetsGeometry padding;
+  const _Panel({required this.child, this.padding = const EdgeInsets.all(14)});
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: padding,
+      decoration: BoxDecoration(
+        color: kSurface,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: kBorder),
+      ),
+      child: child,
+    );
+  }
+}
+
+class _SectionHeader extends StatelessWidget {
+  final String label;
+  final int count;
+  const _SectionHeader({required this.label, required this.count});
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Container(width: 4, height: 16, color: kAccent),
+        const SizedBox(width: 10),
+        Text(
+          label,
+          style: const TextStyle(
+            color: kAccent,
+            fontWeight: FontWeight.w900,
+            letterSpacing: 3,
+            fontSize: 12,
+          ),
+        ),
+        const SizedBox(width: 8),
+        Text(
+          '[$count]',
+          style: const TextStyle(
+            color: kTextDim,
+            fontSize: 11,
+            fontFamily: kMono,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        const SizedBox(width: 10),
+        const Expanded(child: Divider(color: kBorder, thickness: 1)),
+      ],
+    );
+  }
+}
+
+/// Individual pump button tile.
+/// Tap → fires endpoint.  Long-press → edit / delete menu.
+class _PumpButtonTile extends StatefulWidget {
+  final PumpButton button;
+  final bool isActive;
+  final VoidCallback onTap;
+  final VoidCallback onEdit;
+  final VoidCallback onDelete;
+
+  const _PumpButtonTile({
+    required this.button,
+    required this.isActive,
+    required this.onTap,
+    required this.onEdit,
+    required this.onDelete,
+  });
+
+  @override
+  State<_PumpButtonTile> createState() => _PumpButtonTileState();
+}
+
+class _PumpButtonTileState extends State<_PumpButtonTile>
+    with SingleTickerProviderStateMixin {
+  bool _pressed = false;
+  late final AnimationController _flashCtrl;
+
+  @override
+  void initState() {
+    super.initState();
+    _flashCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 180),
+    );
+  }
+
+  @override
+  void dispose() {
+    _flashCtrl.dispose();
+    super.dispose();
+  }
+
+  void _setPressed(bool p) {
+    if (mounted && _pressed != p) setState(() => _pressed = p);
+  }
+
+  void _handleTap() {
+    HapticFeedback.selectionClick();
+    _flashCtrl.forward(from: 0).then((_) => _flashCtrl.reverse());
+    widget.onTap();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final btn = widget.button;
+    final isActive = widget.isActive;
+    return GestureDetector(
+      onTapDown: (_) => _setPressed(true),
+      onTapUp: (_) => _setPressed(false),
+      onTapCancel: () => _setPressed(false),
+      onTap: _handleTap,
+      onLongPress: () => _showMenu(context),
+      child: AnimatedScale(
+        scale: _pressed ? 0.94 : 1.0,
+        duration: const Duration(milliseconds: 90),
+        curve: Curves.easeOut,
+        child: AnimatedBuilder(
+          animation: _flashCtrl,
+          builder: (context, child) {
+            final flash = _flashCtrl.value;
+            final baseColor = kSurface;
+            // Press / flash darkens-then-brightens for tactile feel
+            final pressedColor =
+                Color.lerp(kSurface, kAccent.withOpacity(0.18), flash)!;
+            return AnimatedContainer(
+              duration: const Duration(milliseconds: 140),
+              decoration: BoxDecoration(
+                color: _pressed ? pressedColor : baseColor,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(
+                  color: (_pressed || flash > 0 ? kAccent : kBorder),
+                  width: 1,
+                ),
+                boxShadow: (flash > 0
+                    ? [
+                        BoxShadow(
+                          color: kAccent.withOpacity(0.35 * flash),
+                          blurRadius: 14,
+                          spreadRadius: 0,
+                        ),
+                      ]
+                    : null),
+              ),
+              child: child,
+            );
+          },
+          child: Padding(
+            padding: const EdgeInsets.all(10),
+            child: Stack(
+              children: [
+                Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                     
+                      Text(
+                        btn.label.toUpperCase(),
+                        textAlign: TextAlign.center,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: kTextPrimary,
+                          fontWeight: FontWeight.w900,
+                          fontSize: 15,
+                          letterSpacing: 1.5,
+                        ),
+                      ),
+                      if (btn.endpoint.isNotEmpty) ...[
+                        const SizedBox(height: 4),
+                        Text(
+                          btn.endpoint,
+                          textAlign: TextAlign.center,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: kTextDim,
+                            fontSize: 10,
+                            fontFamily: kMono,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                Positioned(
+                  top: 0,
+                  right: 0,
+                  child: Text(
+                    ':${btn.port}',
+                    style: TextStyle(
+                      color: kTextDim,
+                      fontSize: 9,
+                      fontFamily: kMono,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showMenu(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: kSurface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(12)),
+      ),
+      builder: (_) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              margin: const EdgeInsets.symmetric(vertical: 8),
+              width: 40,
+              height: 4,
+              decoration: BoxDecoration(
+                color: kBorder,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            if (widget.button.locked)
+              ListTile(
+                leading: const Icon(Icons.lock_outline, color: kTextDim),
+                title: const Text(
+                  'CORE CONTROL — LOCKED',
+                  style: TextStyle(color: kTextDim, letterSpacing: 1),
+                ),
+              )
+            else ...[
+              ListTile(
+                leading: const Icon(Icons.edit, color: kAccent),
+                title: Text(
+                  'Edit "${widget.button.label}"',
+                  style: const TextStyle(color: kTextPrimary),
+                ),
+                onTap: () {
+                  Navigator.pop(context);
+                  widget.onEdit();
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.delete_outline, color: kDanger),
+                title: const Text('Delete', style: TextStyle(color: kDanger)),
+                onTap: () {
+                  Navigator.pop(context);
+                  widget.onDelete();
+                },
+              ),
+            ],
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// =============================================================================
+// EDIT BUTTON DIALOG
+// =============================================================================
+
+class EditButtonDialog extends StatefulWidget {
+  final PumpButton? button;
+  const EditButtonDialog({super.key, this.button});
+
+  @override
+  State<EditButtonDialog> createState() => _EditButtonDialogState();
+}
+
+class _EditButtonDialogState extends State<EditButtonDialog> {
+  late TextEditingController _label;
+  late TextEditingController _endpoint;
+  late TextEditingController _offEndpoint;
+  int _port = 3000;
+  bool _isToggle = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final b = widget.button;
+    _label = TextEditingController(text: b?.label ?? '');
+    _endpoint = TextEditingController(text: b?.endpoint ?? '');
+    _offEndpoint = TextEditingController(text: b?.toggleOffEndpoint ?? '');
+    _port = b?.port ?? 3000;
+    _isToggle = b?.isToggle ?? false;
+  }
+
+  @override
+  void dispose() {
+    _label.dispose();
+    _endpoint.dispose();
+    _offEndpoint.dispose();
+    super.dispose();
+  }
+
+  InputDecoration _dec(String label) => InputDecoration(
+    labelText: label,
+    labelStyle: const TextStyle(
+      color: kTextDim,
+      fontSize: 11,
+      letterSpacing: 2,
+      fontWeight: FontWeight.bold,
+    ),
+    filled: true,
+    fillColor: kSurface2,
+    enabledBorder: OutlineInputBorder(
+      borderSide: const BorderSide(color: kBorder),
+      borderRadius: BorderRadius.circular(6),
+    ),
+    focusedBorder: OutlineInputBorder(
+      borderSide: const BorderSide(color: kAccent, width: 1.5),
+      borderRadius: BorderRadius.circular(6),
+    ),
+    contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
+  );
+
+  @override
+  Widget build(BuildContext context) {
+    final isNew = widget.button == null;
+    return AlertDialog(
+      backgroundColor: kSurface,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      title: Text(
+        isNew ? 'NEW BUTTON' : 'EDIT BUTTON',
+        style: const TextStyle(
+          color: kAccent,
+          letterSpacing: 3,
+          fontSize: 14,
+          fontWeight: FontWeight.w900,
+        ),
+      ),
+      content: SizedBox(
+        width: 420,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              TextField(
+                controller: _label,
+                style: const TextStyle(color: kTextPrimary),
+                decoration: _dec('LABEL'),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _endpoint,
+                style: const TextStyle(color: kTextPrimary, fontFamily: kMono),
+                decoration: _dec('UDP COMMAND  (e.g. 2, 3, 0)'),
+              ),
+              const SizedBox(height: 12),
+              DropdownButtonFormField<int>(
+                value: _port,
+                dropdownColor: kSurface2,
+                style: const TextStyle(color: kTextPrimary),
+                decoration: _dec('UDP PORT'),
+                items: const [
+                  DropdownMenuItem(
+                    value: 3000,
+                    child: Text(':3000  →  all commands (udp_gpio)'),
+                  ),
+                  DropdownMenuItem(
+                    value: 9000,
+                    child: Text(':9000  →  alternate port'),
+                  ),
+                ],
+                onChanged: (v) => setState(() => _port = v ?? 3000),
+              ),
+              const SizedBox(height: 8),
+              Container(
+                decoration: BoxDecoration(
+                  border: Border.all(color: kBorder),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: SwitchListTile(
+                  title: const Text(
+                    'TOGGLE MODE',
+                    style: TextStyle(
+                      color: kTextPrimary,
+                      letterSpacing: 1.5,
+                      fontWeight: FontWeight.w900,
+                      fontSize: 12,
+                    ),
+                  ),
+                  subtitle: const Text(
+                    'Tap toggles ON / OFF',
+                    style: TextStyle(color: kTextDim, fontSize: 11),
+                  ),
+                  value: _isToggle,
+                  activeColor: kAccent,
+                  onChanged: (v) => setState(() => _isToggle = v),
+                ),
+              ),
+              if (_isToggle) ...[
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _offEndpoint,
+                  style: const TextStyle(
+                    color: kTextPrimary,
+                    fontFamily: kMono,
+                  ),
+                  decoration: _dec('UDP OFF COMMAND  (e.g. 2, 3)'),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text(
+            'CANCEL',
+            style: TextStyle(color: kTextDim, letterSpacing: 2),
+          ),
+        ),
+        ElevatedButton(
+          onPressed: () {
+            if (_label.text.trim().isEmpty) return;
+            final btn = PumpButton(
+              id:
+                  widget.button?.id ??
+                  DateTime.now().millisecondsSinceEpoch.toString(),
+              label: _label.text.trim(),
+              endpoint: _endpoint.text.trim(),
+              port: _port,
+              isToggle: _isToggle,
+              toggleOffEndpoint: _isToggle ? _offEndpoint.text.trim() : '',
+              locked: widget.button?.locked ?? false,
+            );
+            Navigator.pop(context, btn);
+          },
+          style: ElevatedButton.styleFrom(
+            backgroundColor: kAccent,
+            foregroundColor: Colors.black,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(6),
+            ),
+          ),
+          child: const Text(
+            'SAVE',
+            style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: 2),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// =============================================================================
+// SETTINGS DIALOG
+// =============================================================================
+
+class SettingsDialog extends StatefulWidget {
+  final AppConfig config;
+  const SettingsDialog({super.key, required this.config});
+
+  @override
+  State<SettingsDialog> createState() => _SettingsDialogState();
+}
+
+class _SettingsDialogState extends State<SettingsDialog> {
+  late TextEditingController _host;
+  late TextEditingController _port;
+  late TextEditingController _pressureEp;
+  late TextEditingController _pMin;
+  late TextEditingController _pMax;
+
+  @override
+  void initState() {
+    super.initState();
+    _host = TextEditingController(text: widget.config.piHost);
+    _port = TextEditingController(text: widget.config.piPort.toString());
+    _pressureEp = TextEditingController(text: widget.config.pressureEndpoint);
+    _pMin = TextEditingController(
+      text: widget.config.pressureMin.toStringAsFixed(0),
+    );
+    _pMax = TextEditingController(
+      text: widget.config.pressureMax.toStringAsFixed(0),
+    );
+  }
+
+  @override
+  void dispose() {
+    _host.dispose();
+    _port.dispose();
+    _pressureEp.dispose();
+    _pMin.dispose();
+    _pMax.dispose();
+    super.dispose();
+  }
+
+  InputDecoration _dec(String label) => InputDecoration(
+    labelText: label,
+    labelStyle: const TextStyle(
+      color: kTextDim,
+      fontSize: 11,
+      letterSpacing: 2,
+      fontWeight: FontWeight.bold,
+    ),
+    filled: true,
+    fillColor: kSurface2,
+    enabledBorder: OutlineInputBorder(
+      borderSide: const BorderSide(color: kBorder),
+      borderRadius: BorderRadius.circular(6),
+    ),
+    focusedBorder: OutlineInputBorder(
+      borderSide: const BorderSide(color: kAccent, width: 1.5),
+      borderRadius: BorderRadius.circular(6),
+    ),
+    contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
+  );
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: kSurface,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      title: const Text(
+        'SETTINGS',
+        style: TextStyle(
+          color: kAccent,
+          letterSpacing: 3,
+          fontSize: 14,
+          fontWeight: FontWeight.w900,
+        ),
+      ),
+      content: SizedBox(
+        width: 420,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Text(
+                'CONNECTION',
+                style: TextStyle(
+                  color: kTextDim,
+                  fontSize: 10,
+                  letterSpacing: 2,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _host,
+                style: const TextStyle(color: kTextPrimary, fontFamily: kMono),
+                decoration: _dec('PI HOST  (e.g. 192.168.8.2)'),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: _port,
+                keyboardType: TextInputType.number,
+                style: const TextStyle(color: kTextPrimary, fontFamily: kMono),
+                decoration: _dec('PORT'),
+              ),
+              const SizedBox(height: 18),
+              const Text(
+                'PRESSURE',
+                style: TextStyle(
+                  color: kTextDim,
+                  fontSize: 10,
+                  letterSpacing: 2,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _pressureEp,
+                style: const TextStyle(color: kTextPrimary, fontFamily: kMono),
+                decoration: _dec('ENDPOINT'),
+              ),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _pMin,
+                      keyboardType: TextInputType.number,
+                      maxLength: 3,
+                      inputFormatters: [
+                        FilteringTextInputFormatter.digitsOnly,
+                        LengthLimitingTextInputFormatter(3),
+                      ],
+                      style: const TextStyle(
+                        color: kTextPrimary,
+                        fontFamily: kMono,
+                      ),
+                      decoration: _dec('MIN PSI').copyWith(counterText: ''),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: TextField(
+                      controller: _pMax,
+                      keyboardType: TextInputType.number,
+                      maxLength: 3,
+                      inputFormatters: [
+                        FilteringTextInputFormatter.digitsOnly,
+                        LengthLimitingTextInputFormatter(3),
+                      ],
+                      style: const TextStyle(
+                        color: kTextPrimary,
+                        fontFamily: kMono,
+                      ),
+                      decoration: _dec('MAX PSI').copyWith(counterText: ''),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text(
+            'CANCEL',
+            style: TextStyle(color: kTextDim, letterSpacing: 2),
+          ),
+        ),
+        ElevatedButton(
+          onPressed: () {         
+            final cfg = AppConfig(
+              piHost: _host.text.trim().isEmpty
+                  ? '192.168.8.2'
+                  : _host.text.trim(),
+              piPort: int.tryParse(_port.text.trim()) ?? 80,
+              pressureEndpoint: _pressureEp.text.trim().isEmpty
+                  ? '/pressure'
+                  : _pressureEp.text.trim(),
+              pressureMin: (double.tryParse(_pMin.text.trim()) ?? 0).clamp(
+                0,
+                999,
+              ),
+              pressureMax: (double.tryParse(_pMax.text.trim()) ?? 150).clamp(
+                0,
+                999,
+              ),
+            );
+            Navigator.pop(context, cfg);
+          },
+          style: ElevatedButton.styleFrom(
+            backgroundColor: kAccent,
+            foregroundColor: Colors.black,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(6),
+            ),
+          ),
+          child: const Text(
+            'SAVE',
+            style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: 2),
+          ),
+        ),
+      ],
+    );
+  }
+}
